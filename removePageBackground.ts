@@ -1,27 +1,75 @@
-import { deflate, inflate } from "pako";
-import { PDFDict, PDFName, PDFPage, PDFRawStream, PDFRef } from "pdf-lib";
+import { inflate } from "pako";
+import {
+  PDFArray,
+  PDFDict,
+  PDFName,
+  PDFPage,
+  PDFRawStream,
+  PDFRef,
+} from "pdf-lib";
+
+/**
+ * PDFRawStream'i decode edip text olarak döndürür.
+ */
+function decodeStream(stream: PDFRawStream): string {
+  const filterObj = stream.dict.get(PDFName.of("Filter"));
+  const filterName = filterObj ? (filterObj as PDFName).asString() : "none";
+
+  let decoded: Uint8Array;
+  if (filterName === "/FlateDecode") {
+    decoded = inflate(stream.contents);
+  } else {
+    decoded = stream.contents;
+  }
+  return new TextDecoder().decode(decoded);
+}
+
+/**
+ * Büyük beyaz dikdörtgen pattern'ını kontrol eder.
+ * Origin'den (0,0) başlayan ve büyük alan kaplayan (w>100, h>100) dikdörtgenleri hedefler.
+ */
+function isFullPageRect(reMatch: RegExpMatchArray): boolean {
+  const x = parseFloat(reMatch[1]);
+  const y = parseFloat(reMatch[2]);
+  const w = parseFloat(reMatch[3]);
+  const h = parseFloat(reMatch[4]);
+  return x === 0 && y === 0 && w > 100 && h > 100;
+}
+
+const RE_RECT =
+  /^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+re\s*$/;
+const RE_RECT_FILL =
+  /^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+re\s+f\*?\s*$/;
 
 /**
  * Content stream metninden beyaz arka plan dikdörtgenlerini kaldırır.
  *
- * Tespit edilen pattern:
- * ```
- * q
- * /gs0 gs
- * 1 1 1 rg /a0 gs       <- beyaz renk ayarlama
- * 0 0 1240 1753 re f     <- tam sayfa dikdörtgen doldurma
- * 0 0 1240 1753 re f     <- (tekrarlar olabilir)
- * ```
+ * Desteklenen pattern'lar:
  *
- * Strateji: Satır bazlı işle. Beyaz renk satırını bul,
- * ardından gelen "re f" satırlarını kaldır.
+ * Pattern A (re f aynı satırda):
+ *   1 1 1 rg /a0 gs
+ *   0 0 W H re f
+ *
+ * Pattern B (re ve f ayrı satırlarda, CachyOS tarzı):
+ *   1 1 1 rg
+ *   0 0 W H re
+ *   W
+ *   n
+ *   0 0 W H re
+ *   f
  */
 function removeWhiteBackgroundRects(content: string): string {
   const lines = content.split("\n");
   const result: string[] = [];
+  const skipSet = new Set<number>();
   let i = 0;
 
   while (i < lines.length) {
+    if (skipSet.has(i)) {
+      i++;
+      continue;
+    }
+
     const line = lines[i].trim();
 
     // "1 1 1 rg" veya "1 g" pattern'ı: beyaz renk ayarlama
@@ -29,39 +77,71 @@ function removeWhiteBackgroundRects(content: string): string {
     const isWhiteGray = /^1\s+g\b/.test(line) && line.match(/^1\s+g(\s|$)/);
 
     if (isWhiteRgb || isWhiteGray) {
-      // Satırın geri kalanında ek operatörler olabilir (örn: "1 1 1 rg /a0 gs")
-      // Beyaz renk ayarını ve ardından gelen tam sayfa re f satırlarını topla
-      const colorParts = line;
-
-      // Sonraki satırları kontrol et - tam sayfa re f ise kaldır
       let j = i + 1;
-      const refsToRemove: number[] = [];
+      const indicesToRemove: number[] = [];
 
       while (j < lines.length) {
         const nextLine = lines[j].trim();
-        // "0 0 W H re f" pattern'ı - tam sayfa dikdörtgen
-        const reMatch = nextLine.match(
-          /^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+re\s+f\*?\s*$/
-        );
-        if (reMatch) {
-          const x = parseFloat(reMatch[1]);
-          const y = parseFloat(reMatch[2]);
-          const w = parseFloat(reMatch[3]);
-          const h = parseFloat(reMatch[4]);
 
-          // Sadece tam sayfa kaplayan (origin'den başlayan, büyük alan) dikdörtgenleri kaldır
-          if (x === 0 && y === 0 && w > 100 && h > 100) {
-            refsToRemove.push(j);
-            j++;
+        // Pattern A: "X Y W H re f" tek satırda
+        const reFMatch = nextLine.match(RE_RECT_FILL);
+        if (reFMatch && isFullPageRect(reFMatch)) {
+          indicesToRemove.push(j);
+          j++;
+          continue;
+        }
+
+        // Pattern B: "X Y W H re" tek başına (ardından W/n/re/f gelecek)
+        const reOnlyMatch = nextLine.match(RE_RECT);
+        if (reOnlyMatch && isFullPageRect(reOnlyMatch)) {
+          // İleriye bak: W, n, tekrar re, f pattern'ı
+          const blockStart = j;
+          const blockIndices: number[] = [j];
+          let k = j + 1;
+          let foundFill = false;
+
+          while (k < lines.length) {
+            const kLine = lines[k].trim();
+
+            // Clipping operatörleri: W, W*, n
+            if (kLine === "W" || kLine === "W*" || kLine === "n") {
+              blockIndices.push(k);
+              k++;
+              continue;
+            }
+
+            // Tekrar eden rect tanımı
+            const reAgain = kLine.match(RE_RECT);
+            if (reAgain && isFullPageRect(reAgain)) {
+              blockIndices.push(k);
+              k++;
+              continue;
+            }
+
+            // Fill operatörü: f veya f*
+            if (kLine === "f" || kLine === "f*") {
+              blockIndices.push(k);
+              foundFill = true;
+              k++;
+              break;
+            }
+
+            break;
+          }
+
+          if (foundFill) {
+            indicesToRemove.push(...blockIndices);
+            j = k;
             continue;
           }
+          // Fill bulamadıysak bu re satırını atla, normal devam et
         }
+
         break;
       }
 
-      if (refsToRemove.length > 0) {
-        // Beyaz renk satırını da kaldırmamız lazım, ama satırda başka operatörler olabilir
-        // Örn: "1 1 1 rg /a0 gs" -> sadece "1 1 1 rg" kısmını kaldır, "/a0 gs" kalsın
+      if (indicesToRemove.length > 0) {
+        // Beyaz renk satırından renk kısmını kaldır, varsa diğer operatörleri koru
         if (isWhiteRgb) {
           const remaining = line.replace(/1\s+1\s+1\s+rg\s*/, "").trim();
           if (remaining) {
@@ -74,7 +154,11 @@ function removeWhiteBackgroundRects(content: string): string {
           }
         }
 
-        // re f satırlarını atla
+        // Kaldırılacak satırları işaretle
+        for (const idx of indicesToRemove) {
+          skipSet.add(idx);
+        }
+
         i = j;
         continue;
       }
@@ -88,24 +172,85 @@ function removeWhiteBackgroundRects(content: string): string {
 }
 
 /**
- * Bir sayfanın Form XObject content stream'inden beyaz arka plan dikdörtgenlerini kaldırır.
+ * Tek bir PDFRawStream'in içeriğini temizler ve gerekirse yeni stream ile değiştirir.
+ * @returns Yeni stream'in PDFRef'i veya değişiklik yoksa null
+ */
+function cleanStream(
+  stream: PDFRawStream,
+  context: PDFPage["node"]["context"],
+  label: string
+): PDFRef | null {
+  const content = decodeStream(stream);
+  const cleaned = removeWhiteBackgroundRects(content);
+
+  if (cleaned === content) return null;
+
+  const newBytes = new TextEncoder().encode(cleaned);
+  const newStream = context.flateStream(newBytes, {});
+
+  // Orijinal dict'ten gerekli alanları kopyala
+  const newStreamDict = (newStream as any).dict as PDFDict;
+  for (const [key, val] of stream.dict.entries()) {
+    const keyStr = (key as PDFName).asString();
+    if (
+      keyStr !== "/Filter" &&
+      keyStr !== "/Length" &&
+      keyStr !== "/DecodeParms"
+    ) {
+      newStreamDict.set(key as PDFName, val);
+    }
+  }
+
+  const newRef = context.register(newStream);
+  console.log(
+    `  Arka plan kaldırıldı: ${label} (${content.length} -> ${cleaned.length} chars)`
+  );
+  return newRef;
+}
+
+/**
+ * Bir sayfanın beyaz arka plan dikdörtgenlerini kaldırır.
  *
- * Pure function: Sadece verilen PDFPage üzerinde çalışır, başka bir yan etkisi yoktur.
+ * Pure function: Sadece verilen PDFPage üzerinde çalışır.
  *
- * PDF yapısı: Sayfa -> Content Stream -> Form XObject referansı (/x7 Do)
- * Form XObject'in content stream'i şu pattern'ı içerir:
- *   1 1 1 rg /a0 gs
- *   0 0 W H re f        <- tam sayfa beyaz dikdörtgen
- *
- * Bu fonksiyon Form XObject'in stream'ini decode eder, beyaz arka plan satırlarını
- * kaldırır ve yeni bir stream olarak geri yazar.
+ * İki farklı PDF yapısını destekler:
+ * 1. Form XObject içindeki arka plan (orijinal yapı)
+ * 2. Doğrudan sayfa content stream'indeki arka plan (CachyOS tarzı)
  */
 export function removePageBackground(page: PDFPage): void {
-  // Sayfa Resources -> XObject dict'ini bul
+  const context = page.node.context;
+
+  // --- 1. Sayfa Content Stream'ini işle ---
+  const contentsEntry = page.node.get(PDFName.of("Contents"));
+  if (contentsEntry) {
+    const contentsObj = context.lookup(contentsEntry as PDFRef);
+
+    if (contentsObj instanceof PDFRawStream) {
+      // Tek content stream
+      const newRef = cleanStream(contentsObj, context, "ContentStream");
+      if (newRef) {
+        page.node.set(PDFName.of("Contents"), newRef);
+      }
+    } else if (contentsObj instanceof PDFArray) {
+      // Birden fazla content stream
+      for (let i = 0; i < contentsObj.size(); i++) {
+        const ref = contentsObj.get(i) as PDFRef;
+        const stream = context.lookup(ref);
+        if (stream instanceof PDFRawStream) {
+          const newRef = cleanStream(stream, context, `ContentStream[${i}]`);
+          if (newRef) {
+            contentsObj.set(i, newRef);
+          }
+        }
+      }
+    }
+  }
+
+  // --- 2. Form XObject'leri işle ---
   const resourcesRef = page.node.get(PDFName.of("Resources"));
   if (!resourcesRef) return;
 
-  const resourcesDict = page.node.context.lookupMaybe(
+  const resourcesDict = context.lookupMaybe(
     resourcesRef,
     PDFDict
   ) as PDFDict | undefined;
@@ -114,68 +259,26 @@ export function removePageBackground(page: PDFPage): void {
   const xObjectRef = resourcesDict.get(PDFName.of("XObject"));
   if (!xObjectRef) return;
 
-  const xObjectDict = page.node.context.lookupMaybe(
+  const xObjectDict = context.lookupMaybe(
     xObjectRef,
     PDFDict
   ) as PDFDict | undefined;
   if (!xObjectDict) return;
 
-  // XObject dict'teki tüm Form XObject'leri tara
-  const entries = xObjectDict.entries();
-  for (const [name, ref] of entries) {
-    const xObj = page.node.context.lookup(ref as PDFRef);
+  for (const [name, ref] of xObjectDict.entries()) {
+    const xObj = context.lookup(ref as PDFRef);
     if (!(xObj instanceof PDFRawStream)) continue;
 
     const subtype = xObj.dict.get(PDFName.of("Subtype"));
     if (!subtype || (subtype as PDFName).asString() !== "/Form") continue;
 
-    // Form XObject'in content stream'ini decode et
-    const filterObj = xObj.dict.get(PDFName.of("Filter"));
-    const filterName = filterObj ? (filterObj as PDFName).asString() : "none";
-
-    let decoded: Uint8Array;
-    if (filterName === "/FlateDecode") {
-      decoded = inflate(xObj.contents);
-    } else {
-      decoded = xObj.contents;
-    }
-
-    const content = new TextDecoder().decode(decoded);
-
-    // Beyaz arka plan pattern'larını kaldır:
-    // Pattern 1: "1 1 1 rg" (RGB beyaz) ardından gelen "X Y W H re f" satırları
-    // Pattern 2: "1 g" (grayscale beyaz) ardından gelen "X Y W H re f" satırları
-    const cleaned = removeWhiteBackgroundRects(content);
-
-    if (cleaned === content) continue; // Değişiklik yoksa devam et
-
-    // Yeni stream'i oluştur ve geri yaz
-    const newBytes = new TextEncoder().encode(cleaned);
-
-    // Mevcut stream'i güncelle - yeni PDFRawStream oluştur
-    const newStream = page.node.context.flateStream(newBytes, {});
-
-    // Mevcut XObject dict entry'sini yeni stream ile güncelle
-    // dict'teki diğer özellikleri kopyala
-    const newStreamDict = (newStream as any).dict as PDFDict;
-    // Orijinal dict'ten gerekli alanları kopyala
-    for (const [key, val] of xObj.dict.entries()) {
-      const keyStr = (key as PDFName).asString();
-      if (
-        keyStr !== "/Filter" &&
-        keyStr !== "/Length" &&
-        keyStr !== "/DecodeParms"
-      ) {
-        newStreamDict.set(key as PDFName, val);
-      }
-    }
-
-    // Yeni stream'i register et ve XObject dict'te güncelle
-    const newRef = page.node.context.register(newStream);
-    xObjectDict.set(name as PDFName, newRef);
-
-    console.log(
-      `  Arka plan kaldırıldı: ${(name as PDFName).asString()} (${content.length} -> ${cleaned.length} chars)`
+    const newRef = cleanStream(
+      xObj,
+      context,
+      (name as PDFName).asString()
     );
+    if (newRef) {
+      xObjectDict.set(name as PDFName, newRef);
+    }
   }
 }
